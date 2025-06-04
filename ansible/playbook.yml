@@ -1,0 +1,215 @@
+---
+- name: Configure Backup Server
+  hosts: backup_server
+  vars:
+    backup_loopfile: "/home/vagrant/backup.img"
+    backup_mount: "/var/backup"
+    backup_loopfile_size_mb: 2048
+    borg_repo_dir: "/var/backup/borgrepo"
+
+  tasks:
+    - name: Устанавливаем необходимые пакеты на backup-server
+      apt:
+        update_cache: yes
+        name:
+          - borgbackup
+          - openssh-server
+          - rsyslog
+          - cron
+
+    - name: Включаем аутентификацию по паролю в /etc/ssh/sshd_config
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?PasswordAuthentication'
+        line: 'PasswordAuthentication yes'
+        state: present
+
+    - name: Перезапускаем SSH, чтобы изменения вступили в силу
+      service:
+        name: ssh
+        state: restarted
+
+    - name: Создать loopback-файл {{ backup_loopfile }} (2 GB), если ещё нет
+      command: dd if=/dev/zero of={{ backup_loopfile }} bs=1M count={{ backup_loopfile_size_mb }}
+      args:
+        creates: "{{ backup_loopfile }}"
+
+    - name: Отформатировать {{ backup_loopfile }} как ext4
+      filesystem:
+        fstype: ext4
+        dev: "{{ backup_loopfile }}"
+
+    - name: Создать точку монтирования {{ backup_mount }}
+      file:
+        path: "{{ backup_mount }}"
+        state: directory
+        owner: vagrant
+        group: vagrant
+        mode: '0755'
+
+    - name: Добавить запись в /etc/fstab для автоматического монтирования
+      lineinfile:
+        path: /etc/fstab
+        line: "{{ backup_loopfile }} {{ backup_mount }} ext4 loop 0 0"
+        state: present
+
+    - name: Смонтировать {{ backup_loopfile }} в {{ backup_mount }}
+      mount:
+        path: "{{ backup_mount }}"
+        src: "{{ backup_loopfile }}"
+        fstype: ext4
+        opts: loop
+        state: mounted
+
+    - name: Создать директорию Borg-репозитория {{ borg_repo_dir }}
+      file:
+        path: "{{ borg_repo_dir }}"
+        state: directory
+        owner: vagrant
+        group: vagrant
+        mode: '0700'
+
+    - name: Инициализировать зашифрованный Borg-репозиторий локально
+      become_user: vagrant
+      command: borg init --encryption=repokey-blake2 {{ borg_repo_dir }}
+      args:
+        creates: "{{ borg_repo_dir }}/config"
+      register: borg_init_result
+      failed_when: false
+
+    - name: Вывести результат инициализации Borg-репозитория (для отладки)
+      debug:
+        msg: "borg init returned: {{ borg_init_result.stdout }}"
+
+
+
+- name: Configure Client
+  hosts: client
+  vars:
+    borg_repository: "vagrant@192.168.56.10:/var/backup/borgrepo"
+    backup_script: /usr/local/bin/backup.sh
+    ssh_user: "vagrant"
+    ssh_pass: "vagrant"
+
+  tasks:
+    - name: Устанавливаем необходимые пакеты на client (sshpass нужен для входа по паролю)
+      apt:
+        update_cache: yes
+        name:
+          - borgbackup
+          - openssh-client
+          - rsyslog
+          - cron
+          - sshpass
+
+    - name: Перезапустить SSH (необязательно, но для единообразия)
+      service:
+        name: ssh
+        state: restarted
+
+    - name: Создать директорию ~/.ssh и настроить права
+      file:
+        path: /home/vagrant/.ssh
+        state: directory
+        owner: vagrant
+        group: vagrant
+        mode: '0700'
+
+    - name: Развернуть скрипт резервного копирования {{ backup_script }}
+      copy:
+        dest: "{{ backup_script }}"
+        owner: vagrant
+        group: vagrant
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          # Запускаем borg через sshpass – по паролю "vagrant"
+          export BORG_RSH="sshpass -p {{ ssh_pass }} ssh -o StrictHostKeyChecking=no -o PubkeyAuthentication=no -l {{ ssh_user }}"
+          REPO={{ borg_repository }}
+          ARCHIVE_NAME="client-$(date +%Y-%m-%d-%H%M%S)"
+          # Создаем резервную копию каталога /etc
+          borg create -v --stats "$REPO"::"$ARCHIVE_NAME" /etc 2>&1 | logger -t borg-backup
+          # Удаляем старые: ежедневные за 90 дней и месячные за год
+          borg prune -v --prefix "client-" --keep-within 90d --keep-monthly 12 "$REPO" 2>&1 | logger -t borg-prune
+
+    - name: Убедиться, что {{ backup_script }} исполняемый
+      file:
+        path: "{{ backup_script }}"
+        owner: vagrant
+        group: vagrant
+        mode: '0755'
+
+    - name: Создать cron-задачу, запускающую {{ backup_script }} каждые 5 минут
+      cron:
+        name: "borgbackup"
+        user: vagrant
+        minute: "*/5"
+        job: "{{ backup_script }}"
+
+    - name: Перезапустить rsyslog, чтобы логи попадали в /var/log/syslog
+      service:
+        name: rsyslog
+        state: restarted
+
+    - name: Подождать 30 минут для накопления нескольких бэкапов
+      pause:
+        minutes: 30
+
+    - name: Показать список архивов Borg (через sshpass, без попыток по ключу)
+      ansible.builtin.command: >
+        sshpass -p {{ ssh_pass }} ssh -o StrictHostKeyChecking=no -o PubkeyAuthentication=no {{ ssh_user }}@192.168.56.10 borg list {{ borg_repository }}
+      register: borg_archives
+      changed_when: false
+
+    - name: Вывести список архивов в лог Ansible
+      debug:
+        var: borg_archives.stdout_lines
+
+    - name: Удалить каталог /etc на client (симуляция аварии)
+      file:
+        path: /etc
+        state: absent
+      become: true
+
+    - name: Воссоздать пустую директорию /etc
+      file:
+        path: /etc
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+      become: true
+
+    - name: Восстановить последнюю резервную копию из Borg (через sshpass)
+      ansible.builtin.command: >
+        sshpass -p {{ ssh_pass }} ssh -o StrictHostKeyChecking=no -o PubkeyAuthentication=no {{ ssh_user }}@192.168.56.10 borg extract --target "/" {{ borg_repository }}::$(sshpass -p {{ ssh_pass }} ssh -o StrictHostKeyChecking=no -o PubkeyAuthentication=no {{ ssh_user }}@192.168.56.10 borg list {{ borg_repository }} | tail -n1 | awk '{print $1}')
+      args:
+        chdir: /home/vagrant
+      become: true
+
+    - name: Проверить, что /etc/passwd восстановился
+      stat:
+        path: /etc/passwd
+      register: etc_stat
+      become: true
+
+    - name: Вывести результат проверки восстановления /etc
+      debug:
+        msg: "/etc/passwd существует: {{ etc_stat.stat.exists }}"
+
+    - name: Забрать логи /var/log/syslog с client
+      fetch:
+        src: /var/log/syslog
+        dest: logs/client-syslog.log
+        flat: yes
+
+    - name: Забрать логи /var/log/syslog с backup-server (через sshpass)
+      vars:
+        ansible_ssh_user: "{{ ssh_user }}"
+        ansible_ssh_pass: "{{ ssh_pass }}"
+        ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o PubkeyAuthentication=no"
+      delegate_to: 192.168.56.10
+      fetch:
+        src: /var/log/syslog
+        dest: logs/backup-syslog.log
+        flat: yes
